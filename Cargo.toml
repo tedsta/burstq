@@ -1,0 +1,23 @@
+[package]
+name = "burstq"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+async-event = "0.1.0"
+crossbeam-utils = "0.8"
+
+[target.'cfg(loom)'.dependencies]
+loom = { version = "0.7", features = ["futures"] }
+
+[dev-dependencies]
+core_affinity = "0.8"
+criterion = "0.3"
+futures-executor = "0.3"
+
+[[bench]]
+name = "end_to_end"
+harness = false
+
