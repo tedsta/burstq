@@ -12,15 +12,19 @@ use crate::loom_exports::sync::{
     Arc,
 };
 
+/// An error that may be returned when the queue is shutting down - when all senders or all
+/// receivers have been dropped.
 #[derive(Debug)]
 pub enum Error {
     Shutdown,
 }
 
+/// A sending side of a queue.
 pub struct Sender<T> {
     shared: Arc<Shared<T>>,
 }
 
+/// A receiving side of a queue.
 #[derive(Clone)]
 pub struct Receiver<T> {
     shared: Arc<Shared<T>>,
@@ -42,16 +46,20 @@ struct Shared<T> {
     consume_event: Event,
 }
 
+/// A handle to write to some reserved region of the queue. The reserved region must be written in
+/// its entirety before this handle is dropped.
 pub struct Write<'a, T> {
     front: &'a mut [MaybeUninit<T>],
     back: Option<&'a mut [MaybeUninit<T>]>,
 }
 
+/// A handle to read to some reserved region of the queue.
 pub struct Read<'a, T> {
     front: &'a mut [MaybeUninit<T>],
     back: Option<&'a mut [MaybeUninit<T>]>,
 }
 
+/// Create a new bounded mpmc queue.
 pub fn mpmc<T: 'static>(capacity: usize)
     -> (Sender<T>, Receiver<T>)
 {
@@ -88,7 +96,11 @@ pub fn mpmc<T: 'static>(capacity: usize)
 }
 
 impl<T> Sender<T> {
-    #[inline(always)]
+    /// Asynchronously enqueue up to `max_burst_len` values. If the queue is completely full, the
+    /// returned Future will yield to the async runtime until at least one value can be enqueued.
+    ///
+    /// The provided closure will be called with a `Write` reservation handle. The closure must
+    /// write the reservation in its entirety. Failing to do so will result in a panic.
     pub async fn send(
         &self,
         max_burst_len: usize,
@@ -109,7 +121,12 @@ impl<T> Sender<T> {
             .await
     }
 
-    #[inline(always)]
+    /// Attempt to enqueue up to `max_burst_len` values. If the queue is completely full, this
+    /// method will return immediately.
+    ///
+    /// If at least one value can be enqueued, the provided closure will be called with a `Write`
+    /// reservation handle. The closure must write the reservation in its entirety. Failing to do so
+    /// will result in a panic.
     pub fn try_send(
         &self,
         max_burst_len: usize,
@@ -119,6 +136,8 @@ impl<T> Sender<T> {
             return Ok(0);
         }
 
+        // See the ordering used on failure in the compare exchange operation below - this uses
+        // Acquire ordering for the same reason.
         let mut prod_head = self.shared.prod.head.load(Ordering::Acquire);
         let mut prod_next: usize;
         let mut burst_len: usize;
@@ -148,9 +167,9 @@ impl<T> Sender<T> {
                 // `prod_head` value cannot observe a `cons_tail` value that is older than what we
                 // have just observed.
                 Ordering::Release,
-                // On failure, we need to ensure that the subsequent cons_tail value that will be
-                // loaded in the next attempt happens-before the `prod_head` value we get back from
-                // `compare_exchange`.
+                // On failure, we need to ensure that the subsequent `cons_tail` value that will be
+                // loaded in the next attempt is at least as recent as what was observed by the
+                // thread that wrote the `prod_head` value we get back from `compare_exchange`.
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
@@ -202,11 +221,13 @@ impl<T> Sender<T> {
             loom::hint::spin_loop();
         }
         // Mark this enqueue as finished. Synchronizes both with Acquire loads:
-        // - In other producers in the spin-loop above, to ensure writes from other producers
-        //   happen before this thread allows consumers to progress through its written region.
-        // - In consumers at the beginning of dequeue operations, to ensure that all of the writes
-        //   to the ring that were done in this thread happen on consumer threads before they are
-        //   allowed to read the written region.
+        //
+        // - In consumers at the beginning of dequeue operations, to ensure that the write
+        //   to the queue's buffer that was performed by this thread is visible to consumer threads
+        //   before they are allowed to read the written region.
+        //
+        // - In other producers in the spin-loop above, to ensure that writes from other producers
+        //   are observed by consumers who observe our store of `prod_next`.
         self.shared.prod.tail.store(prod_next, Ordering::Release);
 
         self.shared.write_event.notify_all();
@@ -229,12 +250,16 @@ impl<T> Receiver<T> {
         max_burst_len: usize,
         read_fn: impl FnOnce(Read<T>),
     ) -> Result<usize, Error> {
+        // See the ordering used on failure in the compare exchange operation below - this uses
+        // Acquire ordering for the same reason.
         let mut cons_head: usize = self.shared.cons.head.load(Ordering::Acquire);
         let mut cons_next: usize;
         let mut burst_len: usize;
 
         let backoff = Backoff::new();
         loop {
+            // Acquire ordering to ensure all producers' writes up to the tail are visible by this
+            // thread.
             let prod_tail = self.shared.prod.tail.load(Ordering::Acquire);
 
             let entries =
@@ -253,7 +278,13 @@ impl<T> Receiver<T> {
             match self.shared.cons.head.compare_exchange_weak(
                 cons_head,
                 cons_next,
+                // On success, we need to ensure that subsequent consumers that observe the new
+                // `cons_head` value cannot observe a `prod_tail` value that is older than what we
+                // have just observed.
                 Ordering::Release,
+                // On failure, we need to ensure that the subsequent `prod_tail` value that will be
+                // loaded in the next attempt is at least as recent as what was observed by the
+                // thread that wrote the `cons_head` value we get back from `compare_exchange`.
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
@@ -381,6 +412,7 @@ impl<'a, T: Copy> Write<'a, T> {
 }
 
 impl<'a, T> Read<'a, T> {
+    /// Get the length of this read reservation.
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.front.len() + self.back.as_ref().map(|t| t.len()).unwrap_or(0)
