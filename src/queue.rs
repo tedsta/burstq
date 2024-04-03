@@ -14,7 +14,7 @@ use crate::loom_exports::sync::{
 
 /// An error that may be returned when the queue is shutting down - when all senders or all
 /// receivers have been dropped.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum Error {
     Shutdown,
 }
@@ -25,7 +25,6 @@ pub struct Sender<T> {
 }
 
 /// A receiving side of a queue.
-#[derive(Clone)]
 pub struct Receiver<T> {
     shared: Arc<Shared<T>>,
 }
@@ -44,6 +43,9 @@ struct Shared<T> {
 
     write_event: Event,
     consume_event: Event,
+
+    sender_count: AtomicUsize,
+    receiver_count: AtomicUsize,
 }
 
 /// A handle to write to some reserved region of the queue. The reserved region must be written in
@@ -87,6 +89,8 @@ pub fn mpmc<T: 'static>(capacity: usize)
         data,
         write_event,
         consume_event,
+        sender_count: AtomicUsize::new(1),
+        receiver_count: AtomicUsize::new(1),
     });
 
     let producer = Sender { shared: shared.clone() };
@@ -94,6 +98,8 @@ pub fn mpmc<T: 'static>(capacity: usize)
 
     (producer, consumer)
 }
+
+const SHUTDOWN_FLAG: usize = 1 << (usize::BITS - 1);
 
 impl<T> Sender<T> {
     /// Asynchronously enqueue up to `max_burst_len` values. If the queue is completely full, the
@@ -144,6 +150,11 @@ impl<T> Sender<T> {
 
         let backoff = Backoff::new();
         loop {
+            if prod_head & SHUTDOWN_FLAG != 0 {
+                return Err(Error::Shutdown);
+            }
+            prod_head &= !SHUTDOWN_FLAG;
+
             let cons_tail = self.shared.cons.tail.load(Ordering::Relaxed);
 
             let free_entries =
@@ -238,8 +249,40 @@ impl<T> Sender<T> {
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
+        self.shared.sender_count.fetch_add(1, Ordering::Relaxed);
+
         Self {
             shared: self.shared.clone(),
+        }
+    }
+}
+
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
+        let sender_count = self.shared.sender_count.fetch_sub(1, Ordering::Relaxed);
+        if sender_count == 1 {
+            // Dropping the last sender - notify receivers that we are shutting down.
+            self.shared.cons.head.fetch_or(SHUTDOWN_FLAG, Ordering::Relaxed);
+        }
+    }
+}
+
+impl<T> Clone for Receiver<T> {
+    fn clone(&self) -> Self {
+        self.shared.receiver_count.fetch_add(1, Ordering::Relaxed);
+
+        Self {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+impl<T> Drop for Receiver<T> {
+    fn drop(&mut self) {
+        let receiver_count = self.shared.receiver_count.fetch_sub(1, Ordering::Relaxed);
+        if receiver_count == 1 {
+            // Dropping the last receiver - notify senders that we are shutting down.
+            self.shared.prod.head.fetch_or(SHUTDOWN_FLAG, Ordering::Relaxed);
         }
     }
 }
@@ -258,6 +301,11 @@ impl<T> Receiver<T> {
 
         let backoff = Backoff::new();
         loop {
+            if cons_head & SHUTDOWN_FLAG != 0 {
+                return Err(Error::Shutdown);
+            }
+            cons_head &= !SHUTDOWN_FLAG;
+
             // Acquire ordering to ensure all producers' writes up to the tail are visible by this
             // thread.
             let prod_tail = self.shared.prod.tail.load(Ordering::Acquire);
@@ -555,6 +603,78 @@ mod test {
         })
         .unwrap();
         assert_eq!(n, 9);
+    }
+
+    #[cfg(not(loom))]
+    #[test]
+    fn test_sender_shutdown() {
+        let (tx, rx) = mpmc::<usize>(25);
+
+        std::mem::drop(rx);
+
+        let r = tx.try_send(1, |_| { });
+        assert_eq!(r, Err(Error::Shutdown));
+    }
+
+    #[cfg(not(loom))]
+    #[test]
+    fn test_sender_clone_then_shutdown() {
+        let (tx, rx) = mpmc::<usize>(25);
+        let rx2 = rx.clone();
+
+        std::mem::drop(rx);
+
+        let r = tx.try_send(1, |w| w.write_slice(&[123]));
+        assert_eq!(r, Ok(1));
+
+        let mut did_receive = false;
+        let r = rx2.try_recv(1, |r| {
+            did_receive = true;
+            assert_eq!(*r.get(0), 123);
+        });
+        assert!(did_receive);
+        assert_eq!(r, Ok(1));
+
+        std::mem::drop(rx2);
+
+        let r = tx.try_send(1, |_| { });
+        assert_eq!(r, Err(Error::Shutdown));
+    }
+
+    #[cfg(not(loom))]
+    #[test]
+    fn test_receiver_shutdown() {
+        let (tx, rx) = mpmc::<usize>(25);
+
+        std::mem::drop(tx);
+
+        let r = rx.try_recv(1, |_| { });
+        assert_eq!(r, Err(Error::Shutdown));
+    }
+
+    #[cfg(not(loom))]
+    #[test]
+    fn test_receive_clone_then_shutdown() {
+        let (tx, rx) = mpmc::<usize>(25);
+        let tx2 = tx.clone();
+
+        std::mem::drop(tx);
+
+        let r = tx2.try_send(1, |w| w.write_slice(&[123]));
+        assert_eq!(r, Ok(1));
+
+        let mut did_receive = false;
+        let r = rx.try_recv(1, |r| {
+            did_receive = true;
+            assert_eq!(*r.get(0), 123);
+        });
+        assert!(did_receive);
+        assert_eq!(r, Ok(1));
+
+        std::mem::drop(tx2);
+
+        let r = rx.try_recv(1, |_| { });
+        assert_eq!(r, Err(Error::Shutdown));
     }
 
     #[cfg(loom)]
