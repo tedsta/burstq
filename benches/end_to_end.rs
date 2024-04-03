@@ -12,13 +12,13 @@ fn block_on<F: Future>(f: F) -> F::Output {
 }
 
 fn burst_mpmc_x10000(c: &mut Criterion) {
-    let tx_batch_size = 32;
-    let rx_batch_size = 32;
+    let tx_batch_size = 1;
+    let rx_batch_size = 1;
     let tx_threads = 4;
 
     assert_eq!(10000 % tx_threads, 0);
 
-    let (tx, rx) = burstq::mpmc::<usize>(4000);
+    let (tx, rx) = burstq::mpmc::<usize>(500);
     let barrier = Arc::new(Barrier::new(tx_threads + 1));
 
     for thread_id in 0..tx_threads {
@@ -73,9 +73,57 @@ fn burst_mpmc_x10000(c: &mut Criterion) {
     });
 }
 
+fn flume_x10000(c: &mut Criterion) {
+    let tx_threads = 4;
+
+    assert_eq!(10000 % tx_threads, 0);
+
+    let (tx, rx) = flume::bounded::<usize>(500);
+    let barrier = Arc::new(Barrier::new(tx_threads + 1));
+
+    for thread_id in 0..tx_threads {
+        let tx = tx.clone();
+        let barrier = barrier.clone();
+
+        std::thread::spawn(move || {
+            core_affinity::set_for_current(CoreId { id: thread_id + 1 });
+
+            block_on(async {
+                loop {
+                    barrier.wait();
+
+                    let mut progress = 0;
+                    while progress < 10000 / tx_threads {
+                        tx.send_async(42).await.unwrap();
+                        progress += 1;
+                    }
+                }
+            });
+        });
+    }
+
+    core_affinity::set_for_current(CoreId { id: 0 });
+
+    c.bench_function("flume mpmc x10000", |b| {
+        b.iter(|| {
+            block_on(async {
+                barrier.wait();
+
+                let mut progress = 0;
+                while progress < 10000 {
+                    let r = rx.recv_async().await.unwrap();
+                    progress += 1;
+
+                    assert_eq!(r, 42);
+                }
+            })
+        })
+    });
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = burst_mpmc_x10000
+    targets = burst_mpmc_x10000, flume_x10000
 }
 criterion_main!(benches);
