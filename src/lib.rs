@@ -10,6 +10,10 @@
 //! size that is the same at both senders and receivers, you may be better off using one of the many
 //! other channel crates.
 
+#![no_std]
+
+extern crate alloc;
+
 pub use queue::{
     mpmc,
     Sender,

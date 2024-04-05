@@ -1,4 +1,4 @@
-use std::mem::MaybeUninit;
+use core::mem::MaybeUninit;
 
 // Adapted from std
 // https://github.com/rust-lang/rust/issues/79995
@@ -7,7 +7,7 @@ where
     T: Copy,
 {
     // SAFETY: &[T] and &[MaybeUninit<T>] have the same layout
-    let uninit_src: &[MaybeUninit<T>] = unsafe { std::mem::transmute(src) };
+    let uninit_src: &[MaybeUninit<T>] = unsafe { core::mem::transmute(src) };
 
     this.copy_from_slice(uninit_src);
 

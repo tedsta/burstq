@@ -10,7 +10,7 @@ pub(crate) mod sync {
 #[cfg(not(loom))]
 #[allow(unused_imports)]
 pub(crate) mod sync {
-    pub(crate) use std::sync::Arc;
+    pub(crate) use alloc::sync::Arc;
 
     pub(crate) mod atomic {
         pub(crate) use core::sync::atomic::AtomicUsize;

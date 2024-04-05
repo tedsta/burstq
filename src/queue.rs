@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use core::{
     cell::Cell,
     mem::MaybeUninit,
@@ -545,6 +546,7 @@ impl<'a, T: 'static> Iterator for ReadIter<'a, T> {
 
 #[cfg(test)]
 mod test {
+    use alloc::vec::Vec;
     use super::*;
 
     #[cfg(not(loom))]
@@ -610,7 +612,7 @@ mod test {
     fn test_sender_shutdown() {
         let (tx, rx) = mpmc::<usize>(25);
 
-        std::mem::drop(rx);
+        drop(rx);
 
         let r = tx.try_send(1, |_| { });
         assert_eq!(r, Err(Error::Shutdown));
@@ -622,7 +624,7 @@ mod test {
         let (tx, rx) = mpmc::<usize>(25);
         let rx2 = rx.clone();
 
-        std::mem::drop(rx);
+        drop(rx);
 
         let r = tx.try_send(1, |w| w.write_slice(&[123]));
         assert_eq!(r, Ok(1));
@@ -635,7 +637,7 @@ mod test {
         assert!(did_receive);
         assert_eq!(r, Ok(1));
 
-        std::mem::drop(rx2);
+        drop(rx2);
 
         let r = tx.try_send(1, |_| { });
         assert_eq!(r, Err(Error::Shutdown));
@@ -646,7 +648,7 @@ mod test {
     fn test_receiver_shutdown() {
         let (tx, rx) = mpmc::<usize>(25);
 
-        std::mem::drop(tx);
+        drop(tx);
 
         let r = rx.try_recv(1, |_| { });
         assert_eq!(r, Err(Error::Shutdown));
@@ -658,7 +660,7 @@ mod test {
         let (tx, rx) = mpmc::<usize>(25);
         let tx2 = tx.clone();
 
-        std::mem::drop(tx);
+        drop(tx);
 
         let r = tx2.try_send(1, |w| w.write_slice(&[123]));
         assert_eq!(r, Ok(1));
@@ -671,7 +673,7 @@ mod test {
         assert!(did_receive);
         assert_eq!(r, Ok(1));
 
-        std::mem::drop(tx2);
+        drop(tx2);
 
         let r = rx.try_recv(1, |_| { });
         assert_eq!(r, Err(Error::Shutdown));
@@ -711,7 +713,7 @@ mod test {
         rx_threads_count: usize,
         tx_batches: usize,
     ) {
-        use std::rc::Rc;
+        use alloc::rc::Rc;
         use core::cell::RefCell;
 
         let tx_batch_size = 32;
