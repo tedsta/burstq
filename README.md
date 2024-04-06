@@ -4,7 +4,7 @@ A multi-producer, multi-consumer channel that supports sending or receiving mult
 
 Currently, only async and busy-waiting modes are supported. If you want to block the current thread, you'll need to use a minimal async executor such as [pollster](docs.rs/pollster).
 
-```
+```rust
 let (tx, rx) = mpmc::<u32>(5);
 
 let thread = std::thread::spawn(move || {
