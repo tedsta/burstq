@@ -22,12 +22,12 @@ pub enum Error {
     Shutdown,
 }
 
-/// A sending side of a queue.
+/// A sending end of a channel.
 pub struct Sender<T> {
     shared: Arc<Shared<T>>,
 }
 
-/// A receiving side of a queue.
+/// A receiving end of a channel.
 pub struct Receiver<T> {
     shared: Arc<Shared<T>>,
 }
