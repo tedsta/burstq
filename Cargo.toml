@@ -27,7 +27,7 @@ loom = { version = "0.7", features = ["futures"] }
 core_affinity = "0.8"
 criterion = "0.3"
 flume = "0.11"
-pollster = "*"
+pollster = "0.3"
 
 [[bench]]
 name = "end_to_end"
