@@ -10,7 +10,7 @@ let (tx, rx) = mpmc::<u32>(5);
 let thread = std::thread::spawn(move || {
     pollster::block_on(async move {
         let mut next = 0;
-        let payload: Vec<u32> = (0..10).collect();
+        let payload: Vec<_> = (0..10).collect();
 
         while next < 10 {
             let n = tx.send(10 - next, |w| {

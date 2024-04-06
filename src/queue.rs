@@ -109,11 +109,14 @@ pub fn mpmc<T: 'static>(capacity: usize)
 const SHUTDOWN_FLAG: usize = 1 << (usize::BITS - 1);
 
 impl<T> Sender<T> {
-    /// Asynchronously enqueue up to `max_burst_len` values. If the queue is completely full, the
-    /// returned Future will yield to the async runtime until at least one value can be enqueued.
+    /// Asynchronously send up to `max_burst_len` values. If the queue is completely full, the
+    /// returned Future will yield to the async runtime until at least one value can be sent.
     ///
     /// The provided closure will be called with a `Write` reservation handle. The closure must
-    /// write the reservation in its entirety. Failing to do so will result in a panic.
+    /// write the reservation in its entirety. This is guaranteed if using `Write::write_slice`.
+    /// But if the unsafe `Write::write_at` method is used, you **must** ensure that `write_at` is
+    /// called exactly once at **every** index of the `Write` - failing to do so will result in
+    /// undefined behavior when receivers attempt to read the uninitialized values.
     pub async fn send(
         &self,
         max_burst_len: usize,
@@ -134,12 +137,10 @@ impl<T> Sender<T> {
             .await
     }
 
-    /// Attempt to enqueue up to `max_burst_len` values. If the queue is completely full, this
+    /// Attempt to send up to `max_burst_len` values. If the queue is completely full, this
     /// method will return immediately.
     ///
-    /// If at least one value can be enqueued, the provided closure will be called with a `Write`
-    /// reservation handle. The closure must write the reservation in its entirety. Failing to do so
-    /// will result in a panic.
+    /// See `Sender::send` for details about the `write_fn` parameter.
     pub fn try_send(
         &self,
         max_burst_len: usize,
@@ -152,11 +153,13 @@ impl<T> Sender<T> {
         Ok(n)
     }
 
-    /// Attempt to enqueue up to `max_burst_len` values. If the queue is completely full, this
-    /// method will return immediately. Don't notify async Receivers that new items are available.
+    /// Attempt to send up to `max_burst_len` values. If the queue is completely full, this
+    /// method will return immediately.
     ///
-    /// This method should be used iff suitable if Receivers only ever receive with `try_recv` or
-    /// `try_recv_quiet`.
+    /// This method doesn't notify async Receivers that new values are available. It should be used
+    /// if and only if Receivers only ever receive with `try_recv` or `try_recv_quiet`.
+    ///
+    /// See `Sender::send` for details about the `write_fn` parameter.
     pub fn try_send_quiet(
         &self,
         max_burst_len: usize,
@@ -312,6 +315,13 @@ impl<T> Drop for Receiver<T> {
 }
 
 impl<T> Receiver<T> {
+    /// Asynchronously receive up to `max_burst_len` values. If the queue is completely empty, the
+    /// returned Future will yield to the async runtime until at least one value can be received.
+    ///
+    /// The provided `read_fn` closure will be called with a `Read` reservation handle that can be
+    /// used to read the received values. If `T` is `!Copy` (it has a destructor), failing to take
+    /// all items from the `Read` will result in leaked values. Currently the only way to take items
+    /// from a `Read` instance is via `Read::into_iter`.
     pub async fn recv(
         &self,
         burst_len: usize,
@@ -328,6 +338,10 @@ impl<T> Receiver<T> {
             .await
     }
 
+    /// Attempt to receive up to `max_burst_len` values. If the queue is completely empty, this
+    /// method will return `Ok(0)` immediately.
+    ///
+    /// See `Receiver::recv` for details about the `read_fn` parameter.
     pub fn try_recv(
         &self,
         max_burst_len: usize,
@@ -340,6 +354,13 @@ impl<T> Receiver<T> {
         Ok(n)
     }
 
+    /// Attempt to receive up to `max_burst_len` values. If the queue is completely empty, this
+    /// method will return `Ok(0)` immediately.
+    ///
+    /// This method doesn't notify async Senders that new values can be sent. It should be used
+    /// if and only if Senders only ever send with `try_send` or `try_send_quiet`.
+    ///
+    /// See `Receiver::recv` for details about the `read_fn` parameter.
     pub fn try_recv_quiet(
         &self,
         max_burst_len: usize,
@@ -595,7 +616,7 @@ mod test {
         let thread = std::thread::spawn(move || {
             pollster::block_on(async move {
                 let mut next = 0;
-                let payload: Vec<u32> = (0..10).collect();
+                let payload: Vec<_> = (0..10).collect();
 
                 while next < 10 {
                     let n = tx.send(10 - next, |w| {

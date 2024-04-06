@@ -11,7 +11,7 @@ fn block_on<F: Future>(f: F) -> F::Output {
     pollster::block_on(f)
 }
 
-fn burst_mpmc_x10000(c: &mut Criterion) {
+fn burst_mpsc_x10000(c: &mut Criterion) {
     let tx_batch_size = 1;
     let rx_batch_size = 1;
     let tx_threads = 4;
@@ -53,7 +53,7 @@ fn burst_mpmc_x10000(c: &mut Criterion) {
 
     let expected_payload = &vec![42usize; tx_batch_size];
 
-    c.bench_function("burst mpmc x10000", |b| {
+    c.bench_function("burst mpsc x10000", |b| {
         b.iter(|| {
             block_on(async {
                 barrier.wait();
@@ -73,7 +73,7 @@ fn burst_mpmc_x10000(c: &mut Criterion) {
     });
 }
 
-fn flume_x10000(c: &mut Criterion) {
+fn flume_mpsc_x10000(c: &mut Criterion) {
     let tx_threads = 4;
 
     assert_eq!(10000 % tx_threads, 0);
@@ -104,7 +104,7 @@ fn flume_x10000(c: &mut Criterion) {
 
     core_affinity::set_for_current(CoreId { id: 0 });
 
-    c.bench_function("flume mpmc x10000", |b| {
+    c.bench_function("flume mpsc x10000", |b| {
         b.iter(|| {
             block_on(async {
                 barrier.wait();
@@ -124,6 +124,6 @@ fn flume_x10000(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = burst_mpmc_x10000, flume_x10000
+    targets = burst_mpsc_x10000, flume_mpsc_x10000
 }
 criterion_main!(benches);
