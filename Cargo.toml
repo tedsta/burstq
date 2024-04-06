@@ -9,6 +9,7 @@ keywords = ["mpsc", "fifo", "channel", "mpmc"]
 categories = ["concurrency", "data-structures"]
 license = "MIT"
 readme = "README.md"
+exclude = ["/archive"]
 
 [features]
 default = ["std"]
