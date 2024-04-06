@@ -46,6 +46,8 @@ assert_eq!((0..10).sum::<u32>(), received.iter().sum());
 
 The core lock-free enqueue / dequeue algorithm is based on [DPDK's `rte_ring`](https://doc.dpdk.org/guides/prog_guide/ring_lib.html). In particular, it implements the "burst" (as opposed to "bulk") behavior of `rte_ring` where if not all requested items can be enqueued/dequeued, as many as is currently possible will be.
 
+The async-ness of burstq is achieved using the [async-event](https://docs.rs/async-event) crate.
+
 # License
 
 MIT
