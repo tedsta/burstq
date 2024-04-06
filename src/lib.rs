@@ -10,8 +10,9 @@
 //! size that is the same at both senders and receivers, you may be better off using one of the many
 //! other channel crates.
 
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
 
+#[cfg(all(not(feature = "std"), feature = "alloc"))]
 extern crate alloc;
 
 pub use queue::{

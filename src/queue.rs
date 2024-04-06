@@ -1,9 +1,11 @@
-use alloc::boxed::Box;
 use core::{
     cell::Cell,
     mem::MaybeUninit,
     sync::atomic::Ordering,
 };
+
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
 
 use async_event::Event;
 use crossbeam_utils::{Backoff, CachePadded};
@@ -66,6 +68,10 @@ pub struct Read<'a, T> {
 pub fn mpmc<T: 'static>(capacity: usize)
     -> (Sender<T>, Receiver<T>)
 {
+    // We add 1 to the user-specified capacity since one slot in the queue will always be unusable
+    // so that we can discern between the queue being completely full and completely empty.
+    let capacity = capacity + 1;
+
     let write_event = Event::new();
     let consume_event = Event::new();
 
@@ -135,6 +141,23 @@ impl<T> Sender<T> {
     /// reservation handle. The closure must write the reservation in its entirety. Failing to do so
     /// will result in a panic.
     pub fn try_send(
+        &self,
+        max_burst_len: usize,
+        write_fn: impl FnOnce(Write<T>),
+    ) -> Result<usize, Error> {
+        let n = self.try_send_quiet(max_burst_len, write_fn)?;
+        if n > 0 {
+            self.shared.write_event.notify_all();
+        }
+        Ok(n)
+    }
+
+    /// Attempt to enqueue up to `max_burst_len` values. If the queue is completely full, this
+    /// method will return immediately. Don't notify async Receivers that new items are available.
+    ///
+    /// This method should be used iff suitable if Receivers only ever receive with `try_recv` or
+    /// `try_recv_quiet`.
+    pub fn try_send_quiet(
         &self,
         max_burst_len: usize,
         write_fn: impl FnOnce(Write<T>),
@@ -242,8 +265,6 @@ impl<T> Sender<T> {
         //   are observed by consumers who observe our store of `prod_next`.
         self.shared.prod.tail.store(prod_next, Ordering::Release);
 
-        self.shared.write_event.notify_all();
-
         Ok(burst_len)
     }
 }
@@ -263,7 +284,9 @@ impl<T> Drop for Sender<T> {
         let sender_count = self.shared.sender_count.fetch_sub(1, Ordering::Relaxed);
         if sender_count == 1 {
             // Dropping the last sender - notify receivers that we are shutting down.
-            self.shared.cons.head.fetch_or(SHUTDOWN_FLAG, Ordering::Relaxed);
+            // Use Release ordering to ensure that receivers see any items that have already been
+            // written before observing the shutdown flag.
+            self.shared.cons.head.fetch_or(SHUTDOWN_FLAG, Ordering::Release);
         }
     }
 }
@@ -289,7 +312,35 @@ impl<T> Drop for Receiver<T> {
 }
 
 impl<T> Receiver<T> {
+    pub async fn recv(
+        &self,
+        burst_len: usize,
+        mut read_fn: impl FnMut(Read<T>),
+    ) -> Result<usize, Error> {
+        self.shared.write_event
+            .wait_until(|| {
+                match self.try_recv(burst_len, &mut read_fn) {
+                    Ok(0) => None,
+                    Ok(n) => Some(Ok(n)),
+                    Err(e) => Some(Err(e)),
+                }
+            })
+            .await
+    }
+
     pub fn try_recv(
+        &self,
+        max_burst_len: usize,
+        read_fn: impl FnOnce(Read<T>),
+    ) -> Result<usize, Error> {
+        let n = self.try_recv_quiet(max_burst_len, read_fn)?;
+        if n > 0 {
+            self.shared.consume_event.notify_all();
+        }
+        Ok(n)
+    }
+
+    pub fn try_recv_quiet(
         &self,
         max_burst_len: usize,
         read_fn: impl FnOnce(Read<T>),
@@ -302,9 +353,7 @@ impl<T> Receiver<T> {
 
         let backoff = Backoff::new();
         loop {
-            if cons_head & SHUTDOWN_FLAG != 0 {
-                return Err(Error::Shutdown);
-            }
+            let all_senders_dropped = (cons_head & SHUTDOWN_FLAG) != 0;
             cons_head &= !SHUTDOWN_FLAG;
 
             // Acquire ordering to ensure all producers' writes up to the tail are visible by this
@@ -318,15 +367,20 @@ impl<T> Receiver<T> {
                     self.shared.capacity - cons_head + prod_tail
                 };
             if entries == 0 {
-                return Ok(0);
+                if all_senders_dropped {
+                    return Err(Error::Shutdown);
+                } else {
+                    return Ok(0);
+                }
             }
 
             burst_len = core::cmp::min(max_burst_len, entries);
             cons_next = (cons_head + burst_len) % self.shared.capacity;
 
+            let maybe_shutdown_flag = if all_senders_dropped { SHUTDOWN_FLAG } else { 0 };
             match self.shared.cons.head.compare_exchange_weak(
-                cons_head,
-                cons_next,
+                cons_head | maybe_shutdown_flag,
+                cons_next | maybe_shutdown_flag,
                 // On success, we need to ensure that subsequent consumers that observe the new
                 // `cons_head` value cannot observe a `prod_tail` value that is older than what we
                 // have just observed.
@@ -387,25 +441,7 @@ impl<T> Receiver<T> {
         // Mark this consume as finished.
         self.shared.cons.tail.store(cons_next, Ordering::Relaxed);
 
-        self.shared.consume_event.notify_all();
-
         Ok(burst_len)
-    }
-
-    pub async fn recv(
-        &self,
-        burst_len: usize,
-        mut read_fn: impl FnMut(Read<T>),
-    ) -> Result<usize, Error> {
-        self.shared.write_event
-            .wait_until(|| {
-                match self.try_recv(burst_len, &mut read_fn) {
-                    Ok(0) => None,
-                    Ok(n) => Some(Ok(n)),
-                    Err(e) => Some(Err(e)),
-                }
-            })
-            .await
     }
 }
 
@@ -544,15 +580,59 @@ impl<'a, T: 'static> Iterator for ReadIter<'a, T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod test {
-    use alloc::vec::Vec;
     use super::*;
+
+    #[cfg(not(feature = "std"))]
+    use alloc::vec::Vec;
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_simple_example() {
+        let (tx, rx) = mpmc::<u32>(5);
+
+        let thread = std::thread::spawn(move || {
+            pollster::block_on(async move {
+                let mut next = 0;
+                let payload: Vec<u32> = (0..10).collect();
+
+                while next < 10 {
+                    let n = tx.send(10 - next, |w| {
+                        let len = w.len();
+                        w.write_slice(&payload[next..next + len]);
+                    })
+                    .await
+                    .unwrap();
+
+                    next += n;
+                }
+            });
+        });
+
+        let received = pollster::block_on(async move {
+            let mut received = Vec::new();
+
+            while received.len() < 10 {
+                rx.recv(10 - received.len(), |r| {
+                    received.extend(r);
+                })
+                .await
+                .unwrap();
+            }
+
+            received
+        });
+
+        thread.join().unwrap();
+
+        assert_eq!((0..10).sum::<u32>(), received.iter().sum());
+    }
 
     #[cfg(not(loom))]
     #[test]
     fn test_s20_r10_s20_r25() {
-        let (tx, rx) = mpmc(25);
+        let (tx, rx) = mpmc(24);
 
         let write_payload: Vec<u32> = (0..20).collect();
 
@@ -582,7 +662,7 @@ mod test {
     #[cfg(not(loom))]
     #[test]
     fn test_s20_s20_r20_s5_r20() {
-        let (tx, rx) = mpmc(25);
+        let (tx, rx) = mpmc(24);
 
         let write_payload: Vec<u32> = (0..20).collect();
 
@@ -610,7 +690,7 @@ mod test {
     #[cfg(not(loom))]
     #[test]
     fn test_sender_shutdown() {
-        let (tx, rx) = mpmc::<usize>(25);
+        let (tx, rx) = mpmc::<usize>(24);
 
         drop(rx);
 
@@ -621,7 +701,7 @@ mod test {
     #[cfg(not(loom))]
     #[test]
     fn test_sender_clone_then_shutdown() {
-        let (tx, rx) = mpmc::<usize>(25);
+        let (tx, rx) = mpmc::<usize>(24);
         let rx2 = rx.clone();
 
         drop(rx);
@@ -646,7 +726,7 @@ mod test {
     #[cfg(not(loom))]
     #[test]
     fn test_receiver_shutdown() {
-        let (tx, rx) = mpmc::<usize>(25);
+        let (tx, rx) = mpmc::<usize>(24);
 
         drop(tx);
 
@@ -657,7 +737,7 @@ mod test {
     #[cfg(not(loom))]
     #[test]
     fn test_receive_clone_then_shutdown() {
-        let (tx, rx) = mpmc::<usize>(25);
+        let (tx, rx) = mpmc::<usize>(24);
         let tx2 = tx.clone();
 
         drop(tx);
@@ -678,6 +758,11 @@ mod test {
         let r = rx.try_recv(1, |_| { });
         assert_eq!(r, Err(Error::Shutdown));
     }
+}
+
+#[cfg(all(test, loom))]
+mod test {
+    use super::*;
 
     #[cfg(loom)]
     #[test]
@@ -685,10 +770,12 @@ mod test {
         let tx_threads_count = 1;
         let rx_threads_count = 1;
         let tx_batches = 4;
+        let default_preemption_bound = Some(3);
         e2e_loom(
             tx_threads_count,
             rx_threads_count,
             tx_batches,
+            default_preemption_bound,
         );
     }
 
@@ -700,10 +787,12 @@ mod test {
         let tx_threads_count = 2;
         let rx_threads_count = 2;
         let tx_batches = 3;
+        let default_preemption_bound = Some(3);
         e2e_loom(
             tx_threads_count,
             rx_threads_count,
             tx_batches,
+            default_preemption_bound,
         );
     }*/
 
@@ -712,9 +801,14 @@ mod test {
         tx_threads_count: usize,
         rx_threads_count: usize,
         tx_batches: usize,
+        default_preemption_bound: Option<usize>,
     ) {
-        use alloc::rc::Rc;
         use core::cell::RefCell;
+
+        #[cfg(feature = "std")]
+        use std::rc::Rc;
+        #[cfg(not(feature = "std"))]
+        use alloc::rc::Rc;
 
         let tx_batch_size = 32;
         let rx_batch_size = tx_batch_size * 3 / 2;
@@ -723,7 +817,12 @@ mod test {
         assert_eq!(total_item_count % 2, 0);
         assert_eq!(total_item_count % rx_threads_count, 0);
 
-        loom::model(move || {
+        let mut builder = loom::model::Builder::new();
+        if builder.preemption_bound.is_none() {
+            builder.preemption_bound = default_preemption_bound;
+        }
+
+        builder.check(move || {
             let (tx, rx) = mpmc(total_item_count / 2 + 1);
 
             let sent_items = Rc::new(RefCell::new(Vec::<usize>::new()));
@@ -744,7 +843,7 @@ mod test {
                         }
 
                         let write_payload: Vec<_> = (start .. start + tx_batch_size).collect();
-                        let n = match tx.try_send(want_count, |w| {
+                        let n = match tx.try_send_quiet(want_count, |w| {
                             let len = w.len();
                             w.write_slice(&write_payload[..len]);
                             sent_items.borrow_mut().extend(&write_payload[..len]);
@@ -780,7 +879,7 @@ mod test {
                             break;
                         }
 
-                        let n = match rx.try_recv(want_count, |r| {
+                        let n = match rx.try_recv_quiet(want_count, |r| {
                             assert!(r.len() <= want_count);
                             recv_items.borrow_mut().extend(r.into_iter());
                         }) {

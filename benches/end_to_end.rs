@@ -8,7 +8,7 @@ use std::sync::{Arc, Barrier};
 fn block_on<F: Future>(f: F) -> F::Output {
     // Helper function to make it easy to try out different executors.
 
-    futures_executor::block_on(f)
+    pollster::block_on(f)
 }
 
 fn burst_mpmc_x10000(c: &mut Criterion) {
