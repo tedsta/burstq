@@ -4,7 +4,7 @@ A multi-producer, multi-consumer channel that supports sending or receiving mult
 
 Currently, only async and busy-waiting modes are supported. If you want to block the current thread, you'll need to use a minimal async executor such as [pollster](docs.rs/pollster).
 
-If you want to send and receive items in relatively large batches (say 32 items per batch) but allow dynamic and uneven batch sizes, this may be the crate for you.
+If you want to send and receive items in relatively large batches (e.g. upwards of 10 items per batch) but allow dynamic and uneven batch sizes, this may be the crate for you.
 
 If you are sending and receiving one item at a time, or, more generally, have an exact batch size that is the same at both senders and receivers, you may be better off using one of the many other channel crates.
 

@@ -2,6 +2,13 @@
 name = "burstq"
 version = "0.1.0"
 edition = "2021"
+description = "A multi-producer, multi-consumer channel that supports sending or receiving multiple values in a single operation."
+repository = "https://github.com/tedsta/burstq"
+documentation = "https://docs.rs/burstq"
+keywords = ["mpsc", "fifo", "channel", "mpmc"]
+categories = ["concurrency", "data-structures"]
+license = "MIT"
+readme = "README.md"
 
 [features]
 default = ["std"]
