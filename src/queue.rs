@@ -1,6 +1,6 @@
 use core::{
     cell::Cell,
-    mem::MaybeUninit,
+    mem::{ManuallyDrop, MaybeUninit},
     sync::atomic::Ordering,
 };
 
@@ -37,18 +37,20 @@ struct Slinky {
     tail: AtomicUsize,
 }
 
+#[repr(C)]
 struct Shared<T> {
-    prod: CachePadded<Slinky>,
-    cons: CachePadded<Slinky>,
-
     capacity: usize,
-    data: *mut MaybeUninit<T>,
 
     write_event: Event,
     consume_event: Event,
 
     sender_count: AtomicUsize,
     receiver_count: AtomicUsize,
+
+    prod: CachePadded<Slinky>,
+    cons: CachePadded<Slinky>,
+
+    data: *mut MaybeUninit<T>,
 }
 
 /// A handle to write to some reserved region of the queue. The reserved region must be written in
@@ -65,9 +67,7 @@ pub struct Read<'a, T> {
 }
 
 /// Create a new bounded mpmc queue.
-pub fn mpmc<T: 'static>(capacity: usize)
-    -> (Sender<T>, Receiver<T>)
-{
+pub fn mpmc<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     // We add 1 to the user-specified capacity since one slot in the queue will always be unusable
     // so that we can discern between the queue being completely full and completely empty.
     let capacity = capacity + 1;
@@ -120,18 +120,28 @@ impl<T> Sender<T> {
     pub async fn send(
         &self,
         max_burst_len: usize,
-        mut write_fn: impl FnMut(Write<T>),
+        write_fn: impl FnOnce(Write<T>),
     ) -> Result<usize, Error> {
         if max_burst_len == 0 {
             return Ok(0);
         }
 
+        let write_fn = &mut ManuallyDrop::new(write_fn);
+
         self.shared.consume_event
             .wait_until(|| {
-                match self.try_send(max_burst_len, &mut write_fn) {
+                match self.try_send_inner(max_burst_len, write_fn) {
                     Ok(0) => None,
-                    Ok(n) => Some(Ok(n)),
-                    Err(e) => Some(Err(e)),
+                    Ok(n) => {
+                        self.shared.write_event.notify_all();
+                        Some(Ok(n))
+                    }
+                    Err(e) => {
+                        // SAFETY: write_fn is guaranteed to not have been taken yet if
+                        // try_send_inner returns Ok(0) or Err(_).
+                        unsafe { let _ = ManuallyDrop::take(write_fn); }
+                        Some(Err(e))
+                    }
                 }
             })
             .await
@@ -165,6 +175,22 @@ impl<T> Sender<T> {
         max_burst_len: usize,
         write_fn: impl FnOnce(Write<T>),
     ) -> Result<usize, Error> {
+        let write_fn = &mut ManuallyDrop::new(write_fn);
+        self.try_send_inner(max_burst_len, write_fn)
+            .map_err(|e| {
+                // SAFETY: write_fn is guaranteed to not have been taken yet if try_send_inner
+                // returns Err(_).
+                unsafe { let _ = ManuallyDrop::take(write_fn); }
+                e
+            })
+    }
+
+    #[inline]
+    pub fn try_send_inner(
+        &self,
+        max_burst_len: usize,
+        write_fn: &mut ManuallyDrop<impl FnOnce(Write<T>)>,
+    ) -> Result<usize, Error> {
         if max_burst_len == 0 {
             return Ok(0);
         }
@@ -192,6 +218,17 @@ impl<T> Sender<T> {
                 };
 
             if free_entries == 0 {
+                // Compare exchange to be sure that we have the latest values and there really is
+                // no space.
+                if let Err(new_prod_head) = self.shared.prod.head.compare_exchange(
+                    prod_head,
+                    prod_head,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                ) {
+                    prod_head = new_prod_head;
+                    continue;
+                }
                 return Ok(0);
             }
 
@@ -223,6 +260,7 @@ impl<T> Sender<T> {
             loom::hint::spin_loop();
         }
 
+        let write_fn = unsafe { ManuallyDrop::take(write_fn) };
         if prod_next > prod_head || prod_next == 0 {
             write_fn(Write {
                 front: unsafe {
@@ -342,6 +380,7 @@ impl<T> Receiver<T> {
     /// method will return `Ok(0)` immediately.
     ///
     /// See `Receiver::recv` for details about the `read_fn` parameter.
+    #[inline]
     pub fn try_recv(
         &self,
         max_burst_len: usize,
@@ -468,7 +507,7 @@ impl<T> Receiver<T> {
 
 impl<'a, T> Write<'a, T> {
     /// Get the length of this write reservation.
-    #[inline(always)]
+    #[inline]
     pub fn len(&self) -> usize {
         self.front.len() + self.back.as_ref().map(|t| t.len()).unwrap_or(0)
     }
@@ -481,7 +520,7 @@ impl<'a, T> Write<'a, T> {
     /// the same position twice, drop will not be called on the first value. If some position never
     /// has `write_at` called for it, it will remain uninitialized and trigger undefined behavior
     /// when the receiver tries to read it.
-    #[inline(always)]
+    #[inline]
     pub unsafe fn write_at(&mut self, index: usize, value: T) {
         if index < self.front.len() {
             self.front[index].write(value);
@@ -494,7 +533,6 @@ impl<'a, T> Write<'a, T> {
 impl<'a, T: Copy> Write<'a, T> {
     /// Fill this write reservation by copying values from the provided slice. The slice's length
     /// must be equal to the reservation's length.
-    #[inline(always)]
     pub fn write_slice(mut self, items: &[T]) {
         use crate::util::maybe_uninit_write_slice;
 
@@ -519,12 +557,12 @@ impl<'a, T: Copy> Write<'a, T> {
 
 impl<'a, T> Read<'a, T> {
     /// Get the length of this read reservation.
-    #[inline(always)]
+    #[inline]
     pub fn len(&self) -> usize {
         self.front.len() + self.back.as_ref().map(|t| t.len()).unwrap_or(0)
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn get(&self, index: usize) -> &T {
         if index < self.front.len() {
             unsafe { self.front[index].assume_init_ref() }
@@ -532,6 +570,21 @@ impl<'a, T> Read<'a, T> {
             unsafe { back[index - self.front.len()].assume_init_ref() }
         } else {
             panic!("Read::get index out of bounds");
+        }
+    }
+
+    /// # Safety
+    /// The provided pointer must point to an array of T with length >= `self.len()`.
+    pub unsafe fn read_to_ptr(self, dst: *mut T) {
+        let front_src = self.front.as_mut_ptr() as *mut T;
+        core::ptr::copy_nonoverlapping(front_src, dst, self.front.len());
+        if let Some(back) = self.back {
+            let back_src = back.as_mut_ptr() as *mut T;
+            core::ptr::copy_nonoverlapping(
+                back_src,
+                dst.offset(self.front.len() as isize),
+                back.len(),
+            );
         }
     }
 }
@@ -546,13 +599,13 @@ impl<T> Drop for Shared<T> {
     }
 }
 
-unsafe impl<T> Send for Shared<T> { }
-unsafe impl<T> Sync for Shared<T> { }
+unsafe impl<T: Send> Send for Shared<T> { }
+unsafe impl<T: Send> Sync for Shared<T> { }
 
-unsafe impl<T> Send for Sender<T> { }
-unsafe impl<T> Send for Receiver<T> { }
+unsafe impl<T: Send> Send for Sender<T> { }
+unsafe impl<T: Send> Send for Receiver<T> { }
 
-impl<'a, T: 'static> IntoIterator for Read<'a, T> {
+impl<'a, T> IntoIterator for Read<'a, T> {
     type Item = T;
     type IntoIter = ReadIter<'a, T>;
 
@@ -569,7 +622,7 @@ pub struct ReadIter<'a, T> {
     index: Cell<usize>,
 }
 
-impl<'a, T: 'static> Iterator for ReadIter<'a, T> {
+impl<'a, T> Iterator for ReadIter<'a, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -650,7 +703,6 @@ mod test {
         assert_eq!((0..10).sum::<u32>(), received.iter().sum());
     }
 
-    #[cfg(not(loom))]
     #[test]
     fn test_s20_r10_s20_r25() {
         let (tx, rx) = mpmc(24);
@@ -680,7 +732,6 @@ mod test {
         assert_eq!(n, 24);
     }
 
-    #[cfg(not(loom))]
     #[test]
     fn test_s20_s20_r20_s5_r20() {
         let (tx, rx) = mpmc(24);
@@ -708,7 +759,6 @@ mod test {
         assert_eq!(n, 9);
     }
 
-    #[cfg(not(loom))]
     #[test]
     fn test_sender_shutdown() {
         let (tx, rx) = mpmc::<usize>(24);
@@ -719,7 +769,6 @@ mod test {
         assert_eq!(r, Err(Error::Shutdown));
     }
 
-    #[cfg(not(loom))]
     #[test]
     fn test_sender_clone_then_shutdown() {
         let (tx, rx) = mpmc::<usize>(24);
@@ -744,7 +793,6 @@ mod test {
         assert_eq!(r, Err(Error::Shutdown));
     }
 
-    #[cfg(not(loom))]
     #[test]
     fn test_receiver_shutdown() {
         let (tx, rx) = mpmc::<usize>(24);
@@ -755,7 +803,6 @@ mod test {
         assert_eq!(r, Err(Error::Shutdown));
     }
 
-    #[cfg(not(loom))]
     #[test]
     fn test_receive_clone_then_shutdown() {
         let (tx, rx) = mpmc::<usize>(24);

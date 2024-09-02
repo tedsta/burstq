@@ -1,6 +1,6 @@
 [package]
 name = "burstq"
-version = "0.1.0"
+version = "0.1.1-pre"
 edition = "2021"
 description = "A multi-producer, multi-consumer channel that supports sending or receiving multiple values in a single operation."
 repository = "https://github.com/tedsta/burstq"
@@ -33,3 +33,5 @@ pollster = "0.3"
 name = "end_to_end"
 harness = false
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

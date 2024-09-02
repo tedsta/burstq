@@ -51,7 +51,7 @@ fn burst_mpsc_x10000(c: &mut Criterion) {
 
     core_affinity::set_for_current(CoreId { id: 0 });
 
-    let expected_payload = &vec![42usize; tx_batch_size];
+    let expected_payload = &vec![42usize; rx_batch_size];
 
     c.bench_function("burst mpsc x10000", |b| {
         b.iter(|| {
