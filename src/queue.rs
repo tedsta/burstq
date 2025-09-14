@@ -130,12 +130,11 @@ impl<T> Sender<T> {
 
         let write_fn = &mut ManuallyDrop::new(write_fn);
 
-        self.shared.consume_event
+        let result = self.shared.consume_event
             .wait_until(|| {
                 match self.try_send_inner(max_burst_len, write_fn) {
                     Ok(0) => None,
                     Ok(n) => {
-                        self.shared.write_event.notify_all();
                         Some(Ok(n))
                     }
                     Err(e) => {
@@ -146,7 +145,11 @@ impl<T> Sender<T> {
                     }
                 }
             })
-            .await
+            .await;
+        if result.is_ok() {
+            self.shared.write_event.notify_all();
+        }
+        result
     }
 
     /// Attempt to send up to `max_burst_len` values. If the queue is completely full, this
@@ -374,15 +377,19 @@ impl<T> Receiver<T> {
         burst_len: usize,
         mut read_fn: impl FnMut(Read<T>),
     ) -> Result<usize, Error> {
-        self.shared.write_event
+        let result = self.shared.write_event
             .wait_until(|| {
-                match self.try_recv(burst_len, &mut read_fn) {
+                match self.try_recv_quiet(burst_len, &mut read_fn) {
                     Ok(0) => None,
                     Ok(n) => Some(Ok(n)),
                     Err(e) => Some(Err(e)),
                 }
             })
-            .await
+            .await;
+        if result.is_ok() {
+            self.shared.consume_event.notify_all();
+        }
+        result
     }
 
     /// Attempt to receive up to `max_burst_len` values. If the queue is completely empty, this
@@ -603,15 +610,17 @@ impl<'a, T> Read<'a, T> {
     /// # Safety
     /// The provided pointer must point to an array of T with length >= `self.len()`.
     pub unsafe fn read_to_ptr(self, dst: *mut T) {
-        let front_src = self.front.as_mut_ptr() as *mut T;
-        core::ptr::copy_nonoverlapping(front_src, dst, self.front.len());
-        if let Some(back) = self.back {
-            let back_src = back.as_mut_ptr() as *mut T;
-            core::ptr::copy_nonoverlapping(
-                back_src,
-                dst.offset(self.front.len() as isize),
-                back.len(),
-            );
+        unsafe {
+            let front_src = self.front.as_mut_ptr() as *mut T;
+            core::ptr::copy_nonoverlapping(front_src, dst, self.front.len());
+            if let Some(back) = self.back {
+                let back_src = back.as_mut_ptr() as *mut T;
+                core::ptr::copy_nonoverlapping(
+                    back_src,
+                    dst.offset(self.front.len() as isize),
+                    back.len(),
+                );
+            }
         }
     }
 }
