@@ -52,7 +52,7 @@ checksum = "8ea184aa71bb362a1157c896979544cc23974e08fd265f29ea96b59f0b4a555b"
 
 [[package]]
 name = "burstq"
-version = "0.1.1-pre"
+version = "0.2.0"
 dependencies = [
  "async-event",
  "core_affinity",
