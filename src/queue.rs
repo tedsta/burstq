@@ -10,10 +10,7 @@ use alloc::boxed::Box;
 use async_event::Event;
 use crossbeam_utils::{Backoff, CachePadded};
 
-use crate::loom_exports::sync::{
-    atomic::AtomicUsize,
-    Arc,
-};
+use crate::loom_exports::sync::{Arc, atomic::AtomicUsize};
 
 /// An error that may be returned when the queue is shutting down - when all senders or all
 /// receivers have been dropped.
@@ -75,13 +72,12 @@ pub fn mpmc<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     let write_event = Event::new();
     let consume_event = Event::new();
 
-    let data: *mut MaybeUninit<T> =
-        core::mem::ManuallyDrop::new(
-            (0..capacity)
-                .map(|_| MaybeUninit::<T>::uninit())
-                .collect::<Box<[_]>>()
-        )
-        .as_mut_ptr();
+    let data: *mut MaybeUninit<T> = core::mem::ManuallyDrop::new(
+        (0..capacity)
+            .map(|_| MaybeUninit::<T>::uninit())
+            .collect::<Box<[_]>>(),
+    )
+    .as_mut_ptr();
 
     let shared = Arc::new(Shared {
         prod: CachePadded::new(Slinky {
@@ -100,7 +96,9 @@ pub fn mpmc<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
         receiver_count: AtomicUsize::new(1),
     });
 
-    let producer = Sender { shared: shared.clone() };
+    let producer = Sender {
+        shared: shared.clone(),
+    };
     let consumer = Receiver { shared };
 
     (producer, consumer)
@@ -130,17 +128,19 @@ impl<T> Sender<T> {
 
         let write_fn = &mut ManuallyDrop::new(write_fn);
 
-        let result = self.shared.consume_event
+        let result = self
+            .shared
+            .consume_event
             .wait_until(|| {
                 match self.try_send_inner(max_burst_len, write_fn) {
                     Ok(0) => None,
-                    Ok(n) => {
-                        Some(Ok(n))
-                    }
+                    Ok(n) => Some(Ok(n)),
                     Err(e) => {
                         // SAFETY: write_fn is guaranteed to not have been taken yet if
                         // try_send_inner returns Ok(0) or Err(_).
-                        unsafe { let _ = ManuallyDrop::take(write_fn); }
+                        unsafe {
+                            let _ = ManuallyDrop::take(write_fn);
+                        }
                         Some(Err(e))
                     }
                 }
@@ -181,13 +181,14 @@ impl<T> Sender<T> {
         write_fn: impl FnOnce(Write<T>),
     ) -> Result<usize, Error> {
         let write_fn = &mut ManuallyDrop::new(write_fn);
-        self.try_send_inner(max_burst_len, write_fn)
-            .map_err(|e| {
-                // SAFETY: write_fn is guaranteed to not have been taken yet if try_send_inner
-                // returns Err(_).
-                unsafe { let _ = ManuallyDrop::take(write_fn); }
-                e
-            })
+        self.try_send_inner(max_burst_len, write_fn).map_err(|e| {
+            // SAFETY: write_fn is guaranteed to not have been taken yet if try_send_inner
+            // returns Err(_).
+            unsafe {
+                let _ = ManuallyDrop::take(write_fn);
+            }
+            e
+        })
     }
 
     #[inline]
@@ -218,12 +219,11 @@ impl<T> Sender<T> {
 
             let cons_tail = self.shared.cons.tail.load(Ordering::Relaxed);
 
-            let free_entries =
-                if cons_tail > prod_head {
-                    cons_tail - prod_head - 1
-                } else {
-                    self.shared.capacity - 1 - prod_head + cons_tail
-                };
+            let free_entries = if cons_tail > prod_head {
+                cons_tail - prod_head - 1
+            } else {
+                self.shared.capacity - 1 - prod_head + cons_tail
+            };
 
             if free_entries == 0 {
                 // Compare exchange to be sure that we have the latest values and there really is
@@ -339,7 +339,10 @@ impl<T> Drop for Sender<T> {
             // Dropping the last sender - notify receivers that we are shutting down.
             // Use Release ordering to ensure that receivers see any items that have already been
             // written before observing the shutdown flag.
-            self.shared.cons.head.fetch_or(SHUTDOWN_FLAG, Ordering::Release);
+            self.shared
+                .cons
+                .head
+                .fetch_or(SHUTDOWN_FLAG, Ordering::Release);
         }
     }
 }
@@ -359,7 +362,10 @@ impl<T> Drop for Receiver<T> {
         let receiver_count = self.shared.receiver_count.fetch_sub(1, Ordering::Relaxed);
         if receiver_count == 1 {
             // Dropping the last receiver - notify senders that we are shutting down.
-            self.shared.prod.head.fetch_or(SHUTDOWN_FLAG, Ordering::Relaxed);
+            self.shared
+                .prod
+                .head
+                .fetch_or(SHUTDOWN_FLAG, Ordering::Relaxed);
         }
     }
 }
@@ -377,13 +383,13 @@ impl<T> Receiver<T> {
         burst_len: usize,
         mut read_fn: impl FnMut(Read<T>),
     ) -> Result<usize, Error> {
-        let result = self.shared.write_event
-            .wait_until(|| {
-                match self.try_recv_quiet(burst_len, &mut read_fn) {
-                    Ok(0) => None,
-                    Ok(n) => Some(Ok(n)),
-                    Err(e) => Some(Err(e)),
-                }
+        let result = self
+            .shared
+            .write_event
+            .wait_until(|| match self.try_recv_quiet(burst_len, &mut read_fn) {
+                Ok(0) => None,
+                Ok(n) => Some(Ok(n)),
+                Err(e) => Some(Err(e)),
             })
             .await;
         if result.is_ok() {
@@ -439,12 +445,11 @@ impl<T> Receiver<T> {
             // thread.
             let prod_tail = self.shared.prod.tail.load(Ordering::Acquire);
 
-            let entries =
-                if prod_tail >= cons_head {
-                    prod_tail - cons_head
-                } else {
-                    self.shared.capacity - cons_head + prod_tail
-                };
+            let entries = if prod_tail >= cons_head {
+                prod_tail - cons_head
+            } else {
+                self.shared.capacity - cons_head + prod_tail
+            };
             if entries == 0 {
                 if all_senders_dropped {
                     return Err(Error::Shutdown);
@@ -471,7 +476,11 @@ impl<T> Receiver<T> {
             burst_len = core::cmp::min(max_burst_len, entries);
             cons_next = (cons_head + burst_len) % self.shared.capacity;
 
-            let maybe_shutdown_flag = if all_senders_dropped { SHUTDOWN_FLAG } else { 0 };
+            let maybe_shutdown_flag = if all_senders_dropped {
+                SHUTDOWN_FLAG
+            } else {
+                0
+            };
             match self.shared.cons.head.compare_exchange_weak(
                 cons_head | maybe_shutdown_flag | seq as usize,
                 cons_next | maybe_shutdown_flag | ((seq + (burst_len << SEQ_SHIFT)) & SEQ_MASK),
@@ -635,11 +644,11 @@ impl<T> Drop for Shared<T> {
     }
 }
 
-unsafe impl<T: Send> Send for Shared<T> { }
-unsafe impl<T: Send> Sync for Shared<T> { }
+unsafe impl<T: Send> Send for Shared<T> {}
+unsafe impl<T: Send> Sync for Shared<T> {}
 
-unsafe impl<T: Send> Send for Sender<T> { }
-unsafe impl<T: Send> Send for Receiver<T> { }
+unsafe impl<T: Send> Send for Sender<T> {}
+unsafe impl<T: Send> Send for Receiver<T> {}
 
 impl<'a, T> IntoIterator for Read<'a, T> {
     type Item = T;
@@ -665,21 +674,13 @@ impl<'a, T> Iterator for ReadIter<'a, T> {
         let index = self.index.replace(self.index.get() + 1);
         if index < self.read.front.len() {
             Some(unsafe {
-                core::mem::replace(
-                    &mut self.read.front[index],
-                    MaybeUninit::uninit(),
-                )
-                .assume_init()
+                core::mem::replace(&mut self.read.front[index], MaybeUninit::uninit()).assume_init()
             })
         } else if let Some(back) = &mut self.read.back {
             let back_index = index - self.read.front.len();
             if back_index < back.len() {
                 Some(unsafe {
-                    core::mem::replace(
-                        &mut back[back_index],
-                        MaybeUninit::uninit(),
-                    )
-                    .assume_init()
+                    core::mem::replace(&mut back[back_index], MaybeUninit::uninit()).assume_init()
                 })
             } else {
                 None
@@ -708,12 +709,13 @@ mod test {
                 let payload: Vec<_> = (0..10).collect();
 
                 while next < 10 {
-                    let n = tx.send(10 - next, |w| {
-                        let len = w.len();
-                        w.write_slice(&payload[next..next + len]);
-                    })
-                    .await
-                    .unwrap();
+                    let n = tx
+                        .send(10 - next, |w| {
+                            let len = w.len();
+                            w.write_slice(&payload[next..next + len]);
+                        })
+                        .await
+                        .unwrap();
 
                     next += n;
                 }
@@ -745,26 +747,39 @@ mod test {
 
         let write_payload: Vec<u32> = (0..20).collect();
 
-        let n = tx.try_send(20, |w| { w.write_slice(&write_payload); }).unwrap();
+        let n = tx
+            .try_send(20, |w| {
+                w.write_slice(&write_payload);
+            })
+            .unwrap();
         assert_eq!(n, 20);
 
         rx.try_recv(10, |r| {
-            assert_eq!(r.into_iter().collect::<Vec<_>>(), &[
-                0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
-            ]);
+            assert_eq!(
+                r.into_iter().collect::<Vec<_>>(),
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9,]
+            );
         })
         .unwrap();
 
-        let n = tx.try_send(20, |w| { w.write_slice(&write_payload[..14]); }).unwrap();
+        let n = tx
+            .try_send(20, |w| {
+                w.write_slice(&write_payload[..14]);
+            })
+            .unwrap();
         assert_eq!(n, 14);
 
-        let n = rx.try_recv(25, |r| {
-            assert_eq!(r.into_iter().collect::<Vec<_>>(), &[
-                10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
-                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
-            ]);
-        })
-        .unwrap();
+        let n = rx
+            .try_recv(25, |r| {
+                assert_eq!(
+                    r.into_iter().collect::<Vec<_>>(),
+                    &[
+                        10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                        11, 12, 13,
+                    ]
+                );
+            })
+            .unwrap();
         assert_eq!(n, 24);
     }
 
@@ -774,24 +789,44 @@ mod test {
 
         let write_payload: Vec<u32> = (0..20).collect();
 
-        let n = tx.try_send(20, |w| { w.write_slice(&write_payload); }).unwrap();
+        let n = tx
+            .try_send(20, |w| {
+                w.write_slice(&write_payload);
+            })
+            .unwrap();
         assert_eq!(n, 20);
-        let n = tx.try_send(20, |w| { w.write_slice(&write_payload[..4]); }).unwrap();
+        let n = tx
+            .try_send(20, |w| {
+                w.write_slice(&write_payload[..4]);
+            })
+            .unwrap();
         assert_eq!(n, 4);
 
-        let n = rx.try_recv(20, |r| {
-            assert_eq!(r.into_iter().collect::<Vec<_>>(), (0..20).collect::<Vec<_>>());
-        })
-        .unwrap();
+        let n = rx
+            .try_recv(20, |r| {
+                assert_eq!(
+                    r.into_iter().collect::<Vec<_>>(),
+                    (0..20).collect::<Vec<_>>()
+                );
+            })
+            .unwrap();
         assert_eq!(n, 20);
 
-        let n = tx.try_send(5, |w| { w.write_slice(&write_payload[..5]); }).unwrap();
+        let n = tx
+            .try_send(5, |w| {
+                w.write_slice(&write_payload[..5]);
+            })
+            .unwrap();
         assert_eq!(n, 5);
 
-        let n = rx.try_recv(20, |r| {
-            assert_eq!(r.into_iter().collect::<Vec<_>>(), &[0, 1, 2, 3, 0, 1, 2, 3, 4]);
-        })
-        .unwrap();
+        let n = rx
+            .try_recv(20, |r| {
+                assert_eq!(
+                    r.into_iter().collect::<Vec<_>>(),
+                    &[0, 1, 2, 3, 0, 1, 2, 3, 4]
+                );
+            })
+            .unwrap();
         assert_eq!(n, 9);
     }
 
@@ -801,7 +836,7 @@ mod test {
 
         drop(rx);
 
-        let r = tx.try_send(1, |_| { });
+        let r = tx.try_send(1, |_| {});
         assert_eq!(r, Err(Error::Shutdown));
     }
 
@@ -825,7 +860,7 @@ mod test {
 
         drop(rx2);
 
-        let r = tx.try_send(1, |_| { });
+        let r = tx.try_send(1, |_| {});
         assert_eq!(r, Err(Error::Shutdown));
     }
 
@@ -835,7 +870,7 @@ mod test {
 
         drop(tx);
 
-        let r = rx.try_recv(1, |_| { });
+        let r = rx.try_recv(1, |_| {});
         assert_eq!(r, Err(Error::Shutdown));
     }
 
@@ -859,7 +894,7 @@ mod test {
 
         drop(tx2);
 
-        let r = rx.try_recv(1, |_| { });
+        let r = rx.try_recv(1, |_| {});
         assert_eq!(r, Err(Error::Shutdown));
     }
 }
@@ -909,10 +944,10 @@ mod test {
     ) {
         use core::cell::RefCell;
 
-        #[cfg(feature = "std")]
-        use std::rc::Rc;
         #[cfg(not(feature = "std"))]
         use alloc::rc::Rc;
+        #[cfg(feature = "std")]
+        use std::rc::Rc;
 
         let tx_batch_size = 32;
         let rx_batch_size = tx_batch_size * 3 / 2;
@@ -946,7 +981,7 @@ mod test {
                             break;
                         }
 
-                        let write_payload: Vec<_> = (start .. start + tx_batch_size).collect();
+                        let write_payload: Vec<_> = (start..start + tx_batch_size).collect();
                         let n = match tx.try_send_quiet(want_count, |w| {
                             let len = w.len();
                             w.write_slice(&write_payload[..len]);
@@ -966,40 +1001,40 @@ mod test {
                 }
             };
 
-            let tx_threads: Vec<_> = (0..tx_threads_count - 1).map(|thread_id| {
-                loom::thread::spawn(build_tx_work_fn(thread_id))
-            })
-            .collect();
+            let tx_threads: Vec<_> = (0..tx_threads_count - 1)
+                .map(|thread_id| loom::thread::spawn(build_tx_work_fn(thread_id)))
+                .collect();
 
-            let rx_threads: Vec<_> = (0..rx_threads_count).map(|_| {
-                let rx = rx.clone();
-                let recv_items = recv_items.clone();
-                loom::thread::spawn(move || {
-                    let mut recv_count = 0;
-                    loop {
-                        let remaining = total_item_count / rx_threads_count - recv_count;
-                        let want_count = core::cmp::min(remaining, rx_batch_size);
-                        if want_count == 0 {
-                            break;
+            let rx_threads: Vec<_> = (0..rx_threads_count)
+                .map(|_| {
+                    let rx = rx.clone();
+                    let recv_items = recv_items.clone();
+                    loom::thread::spawn(move || {
+                        let mut recv_count = 0;
+                        loop {
+                            let remaining = total_item_count / rx_threads_count - recv_count;
+                            let want_count = core::cmp::min(remaining, rx_batch_size);
+                            if want_count == 0 {
+                                break;
+                            }
+
+                            let n = match rx.try_recv_quiet(want_count, |r| {
+                                assert!(r.len() <= want_count);
+                                recv_items.borrow_mut().extend(r.into_iter());
+                            }) {
+                                Ok(n) => n,
+                                Err(Error::Shutdown) => panic!("unexpected shutdown"),
+                            };
+                            assert!(n <= want_count);
+                            recv_count += n;
+
+                            if n == 0 {
+                                loom::hint::spin_loop();
+                            }
                         }
-
-                        let n = match rx.try_recv_quiet(want_count, |r| {
-                            assert!(r.len() <= want_count);
-                            recv_items.borrow_mut().extend(r.into_iter());
-                        }) {
-                            Ok(n) => n,
-                            Err(Error::Shutdown) => panic!("unexpected shutdown"),
-                        };
-                        assert!(n <= want_count);
-                        recv_count += n;
-
-                        if n == 0 {
-                            loom::hint::spin_loop();
-                        }
-                    }
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
             build_tx_work_fn(tx_threads_count - 1)();
 

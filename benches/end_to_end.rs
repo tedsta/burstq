@@ -1,5 +1,5 @@
 use core_affinity::CoreId;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::future::Future;
 use std::sync::{Arc, Barrier};
 
@@ -36,13 +36,15 @@ fn burst_mpsc_x10000(c: &mut Criterion) {
 
                     let mut progress = 0;
                     while progress < 10000 / tx_threads {
-                        let want_burst_size = std::cmp::min(10000 / tx_threads - progress, tx_batch_size);
-                        progress += tx.send(want_burst_size, |w| {
-                            let len = w.len();
-                            w.write_slice(&write_payload[..len]);
-                        })
-                        .await
-                        .unwrap();
+                        let want_burst_size =
+                            std::cmp::min(10000 / tx_threads - progress, tx_batch_size);
+                        progress += tx
+                            .send(want_burst_size, |w| {
+                                let len = w.len();
+                                w.write_slice(&write_payload[..len]);
+                            })
+                            .await
+                            .unwrap();
                     }
                 }
             });
@@ -60,13 +62,14 @@ fn burst_mpsc_x10000(c: &mut Criterion) {
 
                 let mut progress = 0;
                 while progress < 10000 {
-                    progress += rx.recv(rx_batch_size, |r| {
-                        let len = r.len();
-                        assert!(r.len() <= rx_batch_size);
-                        assert!(r.into_iter().eq((&expected_payload[..len]).iter().cloned()));
-                    })
-                    .await
-                    .unwrap();
+                    progress += rx
+                        .recv(rx_batch_size, |r| {
+                            let len = r.len();
+                            assert!(r.len() <= rx_batch_size);
+                            assert!(r.into_iter().eq((&expected_payload[..len]).iter().cloned()));
+                        })
+                        .await
+                        .unwrap();
                 }
             })
         })

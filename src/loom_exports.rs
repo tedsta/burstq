@@ -10,13 +10,12 @@ pub(crate) mod sync {
 #[cfg(not(loom))]
 #[allow(unused_imports)]
 pub(crate) mod sync {
-    #[cfg(feature = "std")]
-    pub(crate) use std::sync::Arc;
     #[cfg(not(feature = "std"))]
     pub(crate) use alloc::sync::Arc;
+    #[cfg(feature = "std")]
+    pub(crate) use std::sync::Arc;
 
     pub(crate) mod atomic {
         pub(crate) use core::sync::atomic::AtomicUsize;
     }
 }
-

@@ -14,4 +14,3 @@ where
     // SAFETY: Valid elements have just been copied into `this` so it is initialized
     unsafe { &mut *(this as *mut [MaybeUninit<T>] as *mut [T]) }
 }
-
